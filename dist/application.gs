@@ -534,6 +534,148 @@ GDriveService.getRootID = function() {
 
 
 /**********************************************
+ * Main copy loop
+ **********************************************/
+
+/**
+ * Copy folders and files from source to destination.
+ * Get parameters from userProperties,
+ * Loop until time runs out,
+ * then call timeout methods, save and createTrigger.
+ *
+ * @param {boolean} resuming whether or not the copy call is resuming an existing folder copy or starting fresh
+ */
+function copy() {
+  // initialize vars
+  var properties = new Properties(),
+    timer = new Timer(),
+    ss, // {object} instance of Sheet class
+    query, // {string} query to generate Files list
+    fileList, // {object} list of files within Drive folder
+    currFolder, // {object} metadata of folder whose children are currently being processed
+    userProperties = PropertiesService.getUserProperties(), // reference to userProperties store
+    triggerId = userProperties.getProperty('triggerId'); // {string} Unique ID for the most recently created trigger
+
+  // Delete previous trigger
+  TriggerService.deleteTrigger(triggerId);
+
+  // Load properties.
+  // If loading properties fails, return the function and
+  // set a trigger to retry in 6 minutes.
+  try {
+    Util.exponentialBackoff(
+      properties.load.bind(properties),
+      'Error restarting script, trying again...'
+    );
+  } catch (e) {
+    var n = Number(userProperties.getProperties().trials);
+    Logger.log(n);
+
+    if (n < 5) {
+      Logger.log('setting trials property');
+      userProperties.setProperty('trials', (n + 1).toString());
+
+      Util.exponentialBackoff(
+        TriggerService.createTrigger,
+        'Error setting trigger.  There has been a server error with Google Apps Script.' +
+          'To successfully finish copying, please refresh the app and click "Resume Copying"' +
+          'and follow the instructions on the page.'
+      );
+    }
+    return;
+  }
+
+  // Create trigger for next run.
+  // This trigger will be deleted if script finishes successfully
+  // or if the stop flag is set.
+  timer.update(userProperties);
+  var duration = timer.calculateTriggerDuration(properties);
+  TriggerService.createTrigger(duration);
+
+  // Initialize logger spreadsheet
+  ss = SpreadsheetApp.openById(properties.spreadsheetId).getSheetByName('Log');
+
+  // Process leftover files from prior query results
+  // that weren't processed before script timed out.
+  // Destination folder must be set to the parent of the first leftover item.
+  // The list of leftover items is an equivalent array to fileList returned from the getFiles() query
+  if (
+    properties.leftovers &&
+    properties.leftovers.items &&
+    properties.leftovers.items.length > 0
+  ) {
+    properties.destFolder = properties.leftovers.items[0].parents[0].id;
+    FileService.processFileList(
+      properties.leftovers.items,
+      properties,
+      userProperties,
+      timer,
+      ss
+    );
+  }
+
+  // Update current runtime and user stop flag
+  timer.update(userProperties);
+
+  // When leftovers are complete, query next folder from properties.remaining
+  while (properties.remaining.length > 0 && timer.canContinue()) {
+    // if pages remained in the previous query, use them first
+    if (properties.pageToken) {
+      currFolder = properties.destFolder;
+    } else {
+      // TODO: This is throwing tons of errors but I don't know why.
+      // for some reason properties.remaining is not being parsed correctly,
+      // so it's a JSON stringy object instead of an actual array.
+      try {
+        currFolder = properties.remaining.shift();
+      } catch (e) {
+        console.error('properties.remaining is not parsed correctly');
+        console.error(e);
+        properties.remaining = JSON.parse(properties.remaining);
+        currFolder = properties.remaining.shift();
+      }
+    }
+
+    // build query
+    query = '"' + currFolder + '" in parents and trashed = false';
+
+    // Query Drive to get the fileList (children) of the current folder, currFolder
+    // Repeat if pageToken exists (i.e. more than 1000 results return from the query)
+    do {
+      try {
+        fileList = GDriveService.getFiles(query, properties.pageToken);
+      } catch (e) {
+        Util.log(ss, Util.composeErrorMsg(e));
+      }
+      if (!fileList) {
+        console.log('fileList is undefined. currFolder:', currFolder);
+      }
+
+      // Send items to processFileList() to copy if there is anything to copy
+      if (fileList && fileList.items && fileList.items.length > 0) {
+        FileService.processFileList(
+          fileList.items,
+          properties,
+          userProperties,
+          timer,
+          ss
+        );
+      } else {
+        Logger.log('No children found.');
+      }
+
+      // get next page token to continue iteration
+      properties.pageToken = fileList ? fileList.nextPageToken : null;
+
+      timer.update(userProperties);
+    } while (properties.pageToken && timer.canContinue());
+  }
+
+  // Cleanup
+  Util.cleanup(properties, fileList, userProperties, timer, ss);
+}
+
+/**********************************************
  * Contains runtime properties for script
  **********************************************/
 
@@ -664,6 +806,222 @@ Properties.setUserPropertiesStore = function(
   userProperties.setProperty('stop', 'false');
 };
 
+
+/**********************************************
+ * These functions are called from the front end via
+ * google.script.run
+ *
+ * They need to be globally available so the calls work as expected
+ **********************************************/
+
+/**
+ * Serves HTML of the application for HTTP GET requests.
+ * If folderId is provided as a URL parameter, the web app will list
+ * the contents of that folder (if permissions allow). Otherwise
+ * the web app will list the contents of the root folder.
+ *
+ * @param {Object} e event parameter that can contain information
+ *     about any URL parameters provided.
+ */
+function doGet(e) {
+  var template = HtmlService.createTemplateFromFile('Index');
+
+  // Build and return HTML in IFRAME sandbox mode.
+  return template
+    .evaluate()
+    .setTitle('Copy a Google Drive folder')
+    .setSandboxMode(HtmlService.SandboxMode.IFRAME);
+}
+
+/**
+ * Initialize destination folder, logger spreadsheet, and properties doc.
+ * Build/add properties to options so it can be saved to the properties doc.
+ * Set UserProperties values and save properties to propertiesDoc.
+ * Add link for destination folder to logger spreadsheet.
+ * Return IDs of created destination folder and logger spreadsheet
+ *
+ * @param {object} options
+ *  {
+ *    srcFolderID: string,
+ *    srcParentId: string,
+ *    srcFolderName: string,
+ *    srcFolderURL: string,
+ *    destFolderName: string,
+ *    copyPermissions: boolean,
+ *    copyTo: number,
+ *    destParentID: string,
+ *  }
+ */
+function initialize(options) {
+  var destFolder, // {Object} instance of Folder class representing destination folder
+    spreadsheet, // {Object} instance of Spreadsheet class
+    propertiesDocId, // {Object} metadata for Google Document created to hold properties
+    today = Utilities.formatDate(new Date(), 'GMT-5', 'MM-dd-yyyy'); // {string} date of copy
+
+  // Create Files used in copy process
+  destFolder = FileService.initializeDestinationFolder(options, today);
+  spreadsheet = FileService.createLoggerSpreadsheet(today, destFolder.id);
+  propertiesDocId = FileService.createPropertiesDocument(destFolder.id);
+
+  // Build/add properties to options so it can be saved to the properties doc
+  options.destId = destFolder.id;
+  options.spreadsheetId = spreadsheet.id;
+  options.propertiesDocId = propertiesDocId;
+
+  // initialize map with top level source and destination folder
+  options.leftovers = {}; // {Object} FileList object (returned from Files.list) for items not processed in prior execution (filled in saveState)
+  options.map = {}; // {Object} map of source ids (keys) to destination ids (values)
+  options.map[options.srcFolderID] = options.destId;
+  options.remaining = [options.srcFolderID];
+
+  // Add link for destination folder to logger spreadsheet
+  try {
+    SpreadsheetApp.openById(spreadsheet.id)
+      .getSheetByName('Log')
+      .getRange(2, 5)
+      .setValue(
+        '=HYPERLINK("https://drive.google.com/open?id=' +
+          destFolder.id +
+          '","' +
+          options.destFolderName +
+          '")'
+      );
+  } catch (e) {
+    console.error('unable to set folder URL in copy log');
+    console.error(e);
+  }
+
+  options.timeZone = SpreadsheetApp.openById(
+    spreadsheet.id
+  ).getSpreadsheetTimeZone();
+  if (!options.timeZone) {
+    options.timeZone = 'GMT-7';
+  }
+
+  // Adding a row to status list prevents weird style copying in Util.log
+  try {
+    SpreadsheetApp.openById(spreadsheet.id)
+      .getSheetByName('Log')
+      .getRange(5, 1, 1, 5)
+      .setValues([
+        [
+          'Started copying',
+          '',
+          '',
+          '',
+          Utilities.formatDate(
+            new Date(),
+            options.timeZone,
+            'MM-dd-yy hh:mm:ss aaa'
+          )
+        ]
+      ]);
+  } catch (e) {
+    console.error('unable to write "started copying"');
+    console.error(e);
+  }
+
+  // Set UserProperties values and save properties to propertiesDoc
+  Properties.setUserPropertiesStore(
+    options.spreadsheetId,
+    options.propertiesDocId,
+    options.destId,
+    'false'
+  );
+  Properties.save(options);
+
+  // Delete all existing triggers so no scripts overlap
+  deleteAllTriggers();
+
+  // Return IDs of created destination folder and logger spreadsheet
+  return {
+    spreadsheetId: options.spreadsheetId,
+    destFolderId: options.destId,
+    resuming: false
+  };
+}
+
+/**
+ * @param {string} id the folder ID for which to return metadata
+ * @param {string} url the folder URL
+ * @returns {object} the metadata for the folder (File Resource)
+ */
+function getMetadata(id, url) {
+  try {
+    return Drive.Files.get(id);
+  } catch (e) {
+    var errMsg =
+      'Unable to find a folder with the supplied URL. ' +
+      'You submitted ' +
+      url +
+      '. ' +
+      'Please verify that you are using a valid folder URL and try again.';
+    throw new Error(errMsg);
+  }
+}
+
+/**
+ * @returns {string} email of the active user
+ */
+function getUserEmail() {
+  return Session.getActiveUser().getEmail();
+}
+
+/**
+ * Find prior copy folder instance.
+ * Find propertiesDoc and logger spreadsheet, and save IDs to userProperties, which will be used by load.
+ *
+ * @param options object containing information on folder selected in app
+ * @returns {{spreadsheetId: string, destId: string, resuming: boolean}}
+ */
+
+function resume(options) {
+  var priorCopy = FileService.findPriorCopy(options.srcFolderID);
+
+  Properties.setUserPropertiesStore(
+    priorCopy.spreadsheetId,
+    priorCopy.propertiesDocId,
+    options.destFolderId,
+    'true'
+  );
+
+  return {
+    spreadsheetId: priorCopy.spreadsheetId,
+    destFolderId: options.srcFolderID,
+    resuming: true
+  };
+}
+
+/**
+ * Set a flag in the userProperties store that will cancel the current copy folder process
+ */
+function setStopFlag() {
+  return PropertiesService.getUserProperties().setProperty('stop', 'true');
+}
+
+/**
+ * Loop over all triggers and delete
+ */
+function deleteAllTriggers() {
+  var allTriggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < allTriggers.length; i++) {
+    ScriptApp.deleteTrigger(allTriggers[i]);
+  }
+}
+
+/**
+ * @return {number} number of active triggers for this user
+ */
+function getTriggersQuantity() {
+  return ScriptApp.getProjectTriggers().length;
+}
+
+/**
+ * @returns {string} token for use with Google Picker
+ */
+function getOAuthToken() {
+  return ScriptApp.getOAuthToken();
+}
 
 /**********************************************
  * Tracks runtime of application to avoid
@@ -981,361 +1339,3 @@ Util.composeErrorMsg = function(e, customMsg) {
   ];
 };
 
-
-/**********************************************
- * Main copy loop
- **********************************************/
-
-/**
- * Copy folders and files from source to destination.
- * Get parameters from userProperties,
- * Loop until time runs out,
- * then call timeout methods, save and createTrigger.
- *
- * @param {boolean} resuming whether or not the copy call is resuming an existing folder copy or starting fresh
- */
-function copy() {
-  // initialize vars
-  var properties = new Properties(),
-    timer = new Timer(),
-    ss, // {object} instance of Sheet class
-    query, // {string} query to generate Files list
-    fileList, // {object} list of files within Drive folder
-    currFolder, // {object} metadata of folder whose children are currently being processed
-    userProperties = PropertiesService.getUserProperties(), // reference to userProperties store
-    triggerId = userProperties.getProperty('triggerId'); // {string} Unique ID for the most recently created trigger
-
-  // Delete previous trigger
-  TriggerService.deleteTrigger(triggerId);
-
-  // Load properties.
-  // If loading properties fails, return the function and
-  // set a trigger to retry in 6 minutes.
-  try {
-    Util.exponentialBackoff(
-      properties.load.bind(properties),
-      'Error restarting script, trying again...'
-    );
-  } catch (e) {
-    var n = Number(userProperties.getProperties().trials);
-    Logger.log(n);
-
-    if (n < 5) {
-      Logger.log('setting trials property');
-      userProperties.setProperty('trials', (n + 1).toString());
-
-      Util.exponentialBackoff(
-        TriggerService.createTrigger,
-        'Error setting trigger.  There has been a server error with Google Apps Script.' +
-          'To successfully finish copying, please refresh the app and click "Resume Copying"' +
-          'and follow the instructions on the page.'
-      );
-    }
-    return;
-  }
-
-  // Create trigger for next run.
-  // This trigger will be deleted if script finishes successfully
-  // or if the stop flag is set.
-  timer.update(userProperties);
-  var duration = timer.calculateTriggerDuration(properties);
-  TriggerService.createTrigger(duration);
-
-  // Initialize logger spreadsheet
-  ss = SpreadsheetApp.openById(properties.spreadsheetId).getSheetByName('Log');
-
-  // Process leftover files from prior query results
-  // that weren't processed before script timed out.
-  // Destination folder must be set to the parent of the first leftover item.
-  // The list of leftover items is an equivalent array to fileList returned from the getFiles() query
-  if (
-    properties.leftovers &&
-    properties.leftovers.items &&
-    properties.leftovers.items.length > 0
-  ) {
-    properties.destFolder = properties.leftovers.items[0].parents[0].id;
-    FileService.processFileList(
-      properties.leftovers.items,
-      properties,
-      userProperties,
-      timer,
-      ss
-    );
-  }
-
-  // Update current runtime and user stop flag
-  timer.update(userProperties);
-
-  // When leftovers are complete, query next folder from properties.remaining
-  while (properties.remaining.length > 0 && timer.canContinue()) {
-    // if pages remained in the previous query, use them first
-    if (properties.pageToken) {
-      currFolder = properties.destFolder;
-    } else {
-      // TODO: This is throwing tons of errors but I don't know why.
-      // for some reason properties.remaining is not being parsed correctly,
-      // so it's a JSON stringy object instead of an actual array.
-      try {
-        currFolder = properties.remaining.shift();
-      } catch (e) {
-        console.error('properties.remaining is not parsed correctly');
-        console.error(e);
-        properties.remaining = JSON.parse(properties.remaining);
-        currFolder = properties.remaining.shift();
-      }
-    }
-
-    // build query
-    query = '"' + currFolder + '" in parents and trashed = false';
-
-    // Query Drive to get the fileList (children) of the current folder, currFolder
-    // Repeat if pageToken exists (i.e. more than 1000 results return from the query)
-    do {
-      try {
-        fileList = GDriveService.getFiles(query, properties.pageToken);
-      } catch (e) {
-        Util.log(ss, Util.composeErrorMsg(e));
-      }
-      if (!fileList) {
-        console.log('fileList is undefined. currFolder:', currFolder);
-      }
-
-      // Send items to processFileList() to copy if there is anything to copy
-      if (fileList && fileList.items && fileList.items.length > 0) {
-        FileService.processFileList(
-          fileList.items,
-          properties,
-          userProperties,
-          timer,
-          ss
-        );
-      } else {
-        Logger.log('No children found.');
-      }
-
-      // get next page token to continue iteration
-      properties.pageToken = fileList ? fileList.nextPageToken : null;
-
-      timer.update(userProperties);
-    } while (properties.pageToken && timer.canContinue());
-  }
-
-  // Cleanup
-  Util.cleanup(properties, fileList, userProperties, timer, ss);
-}
-
-/**********************************************
- * These functions are called from the front end via
- * google.script.run
- *
- * They need to be globally available so the calls work as expected
- **********************************************/
-
-/**
- * Serves HTML of the application for HTTP GET requests.
- * If folderId is provided as a URL parameter, the web app will list
- * the contents of that folder (if permissions allow). Otherwise
- * the web app will list the contents of the root folder.
- *
- * @param {Object} e event parameter that can contain information
- *     about any URL parameters provided.
- */
-function doGet(e) {
-  var template = HtmlService.createTemplateFromFile('Index');
-
-  // Build and return HTML in IFRAME sandbox mode.
-  return template
-    .evaluate()
-    .setTitle('Copy a Google Drive folder')
-    .setSandboxMode(HtmlService.SandboxMode.IFRAME);
-}
-
-/**
- * Initialize destination folder, logger spreadsheet, and properties doc.
- * Build/add properties to options so it can be saved to the properties doc.
- * Set UserProperties values and save properties to propertiesDoc.
- * Add link for destination folder to logger spreadsheet.
- * Return IDs of created destination folder and logger spreadsheet
- *
- * @param {object} options
- *  {
- *    srcFolderID: string,
- *    srcParentId: string,
- *    srcFolderName: string,
- *    srcFolderURL: string,
- *    destFolderName: string,
- *    copyPermissions: boolean,
- *    copyTo: number,
- *    destParentID: string,
- *  }
- */
-function initialize(options) {
-  var destFolder, // {Object} instance of Folder class representing destination folder
-    spreadsheet, // {Object} instance of Spreadsheet class
-    propertiesDocId, // {Object} metadata for Google Document created to hold properties
-    today = Utilities.formatDate(new Date(), 'GMT-5', 'MM-dd-yyyy'); // {string} date of copy
-
-  // Create Files used in copy process
-  destFolder = FileService.initializeDestinationFolder(options, today);
-  spreadsheet = FileService.createLoggerSpreadsheet(today, destFolder.id);
-  propertiesDocId = FileService.createPropertiesDocument(destFolder.id);
-
-  // Build/add properties to options so it can be saved to the properties doc
-  options.destId = destFolder.id;
-  options.spreadsheetId = spreadsheet.id;
-  options.propertiesDocId = propertiesDocId;
-
-  // initialize map with top level source and destination folder
-  options.leftovers = {}; // {Object} FileList object (returned from Files.list) for items not processed in prior execution (filled in saveState)
-  options.map = {}; // {Object} map of source ids (keys) to destination ids (values)
-  options.map[options.srcFolderID] = options.destId;
-  options.remaining = [options.srcFolderID];
-
-  // Add link for destination folder to logger spreadsheet
-  try {
-    SpreadsheetApp.openById(spreadsheet.id)
-      .getSheetByName('Log')
-      .getRange(2, 5)
-      .setValue(
-        '=HYPERLINK("https://drive.google.com/open?id=' +
-          destFolder.id +
-          '","' +
-          options.destFolderName +
-          '")'
-      );
-  } catch (e) {
-    console.error('unable to set folder URL in copy log');
-    console.error(e);
-  }
-
-  options.timeZone = SpreadsheetApp.openById(
-    spreadsheet.id
-  ).getSpreadsheetTimeZone();
-  if (!options.timeZone) {
-    options.timeZone = 'GMT-7';
-  }
-
-  // Adding a row to status list prevents weird style copying in Util.log
-  try {
-    SpreadsheetApp.openById(spreadsheet.id)
-      .getSheetByName('Log')
-      .getRange(5, 1, 1, 5)
-      .setValues([
-        [
-          'Started copying',
-          '',
-          '',
-          '',
-          Utilities.formatDate(
-            new Date(),
-            options.timeZone,
-            'MM-dd-yy hh:mm:ss aaa'
-          )
-        ]
-      ]);
-  } catch (e) {
-    console.error('unable to write "started copying"');
-    console.error(e);
-  }
-
-  // Set UserProperties values and save properties to propertiesDoc
-  Properties.setUserPropertiesStore(
-    options.spreadsheetId,
-    options.propertiesDocId,
-    options.destId,
-    'false'
-  );
-  Properties.save(options);
-
-  // Delete all existing triggers so no scripts overlap
-  deleteAllTriggers();
-
-  // Return IDs of created destination folder and logger spreadsheet
-  return {
-    spreadsheetId: options.spreadsheetId,
-    destFolderId: options.destId,
-    resuming: false
-  };
-}
-
-/**
- * @param {string} id the folder ID for which to return metadata
- * @param {string} url the folder URL
- * @returns {object} the metadata for the folder (File Resource)
- */
-function getMetadata(id, url) {
-  try {
-    return Drive.Files.get(id);
-  } catch (e) {
-    var errMsg =
-      'Unable to find a folder with the supplied URL. ' +
-      'You submitted ' +
-      url +
-      '. ' +
-      'Please verify that you are using a valid folder URL and try again.';
-    throw new Error(errMsg);
-  }
-}
-
-/**
- * @returns {string} email of the active user
- */
-function getUserEmail() {
-  return Session.getActiveUser().getEmail();
-}
-
-/**
- * Find prior copy folder instance.
- * Find propertiesDoc and logger spreadsheet, and save IDs to userProperties, which will be used by load.
- *
- * @param options object containing information on folder selected in app
- * @returns {{spreadsheetId: string, destId: string, resuming: boolean}}
- */
-
-function resume(options) {
-  var priorCopy = FileService.findPriorCopy(options.srcFolderID);
-
-  Properties.setUserPropertiesStore(
-    priorCopy.spreadsheetId,
-    priorCopy.propertiesDocId,
-    options.destFolderId,
-    'true'
-  );
-
-  return {
-    spreadsheetId: priorCopy.spreadsheetId,
-    destFolderId: options.srcFolderID,
-    resuming: true
-  };
-}
-
-/**
- * Set a flag in the userProperties store that will cancel the current copy folder process
- */
-function setStopFlag() {
-  return PropertiesService.getUserProperties().setProperty('stop', 'true');
-}
-
-/**
- * Loop over all triggers and delete
- */
-function deleteAllTriggers() {
-  var allTriggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < allTriggers.length; i++) {
-    ScriptApp.deleteTrigger(allTriggers[i]);
-  }
-}
-
-/**
- * @return {number} number of active triggers for this user
- */
-function getTriggersQuantity() {
-  return ScriptApp.getProjectTriggers().length;
-}
-
-/**
- * @returns {string} token for use with Google Picker
- */
-function getOAuthToken() {
-  return ScriptApp.getOAuthToken();
-}
