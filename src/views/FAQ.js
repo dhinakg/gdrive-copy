@@ -49,6 +49,14 @@ export default function FAQ() {
         <li>
           <a href="#teamdrives">Does this app support Team Drives?</a>
         </li>
+        <li>
+          <a href="#extensions">Can this app help me auto-generate a folder?</a>
+        </li>
+        <li>
+          <a href="#extensions">
+            I have an idea for an extension to this app. What do I do?
+          </a>
+        </li>
       </ul>
       <h3>
         <a name="longerThan2Mins" />The copying has been paused longer than 2
@@ -201,6 +209,20 @@ export default function FAQ() {
         <a name="teamdrives" />Does this app support Team Drives?
       </h3>
       <div>No.</div>
+      <a href="#top">Top</a>
+
+      <h3>
+        <a name="extensions" />Folder auto-generation and other extensions
+      </h3>
+      <div>
+        Currently, this app is not able to auto-generate folders e.g. for
+        for sales teams when new leads are generated. However, this would
+        probably not require too much modification so reach out to the Recrut
+        development team if you find yourself in need of such a service.<br />
+        Likewise, if you have other requests for extensions to this service that
+        will make you more productive, reach out to the Recrut development team
+        to see if they can help you.
+      </div>
       <a href="#top">Top</a>
     </main>
   );

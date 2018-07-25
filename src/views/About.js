@@ -31,6 +31,17 @@ export default function About() {
       </p>
 
       <p>
+        This app has been modified to allow for local usage hosted on the drive
+        owned by Recrut AS, and not through some web app of an unknown developer
+        (who would in essence act as a data processor if we use the app to move
+        personal data, which we do NOT want).<br />
+        Modifications that allow for template folders to be generated with pre-
+        filled content e.g. for sales purposes could be a possible extension of
+        this service. Reach out to the Recrut developer team if you or your team
+        find youselves in need of this.
+      </p>
+
+      <p>
         This app is licensed under the{' '}
         <a href="https://opensource.org/licenses/MIT" target="_blank">
           MIT License
