@@ -1037,9 +1037,10 @@ function Timer() {
   return this;
 }
 
-// Max runtime per day is 90 minutes. Set max as 88 mins for padding.
+// For a cloud account it doesn't seem to have a max runtime per day limit anymore (previously 90 min, but I think this is for gmail accounts).
+// Still setting a limit to 12 hours (= 720 minutes, 20 used for padding) to not ping Google too much
 // https://developers.google.com/apps-script/guides/services/quotas
-Timer.MAX_RUNTIME_PER_DAY = 88 * 1000 * 60;
+Timer.MAX_RUNTIME_PER_DAY = 700 * 1000 * 60;
 Timer.MAX_RUNTIME = 4.7 * 1000 * 60;
 // durations used for setting Triggers
 Timer.oneDay = 24 * 60 * 60 * 1000;
