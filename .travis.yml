@@ -6,6 +6,9 @@ script:
   - npm run build:prod
   - ls
   - ls dist
+  - cd dist
+  - echo abc > abc
+  - cd ..
   - zip dist.zip dist
 before_deploy:
   - git tag "$(date +'%Y%m%d%H%M%S')-$(git log --format=%h -1)"
