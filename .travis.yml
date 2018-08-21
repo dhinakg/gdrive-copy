@@ -6,15 +6,9 @@ script:
   - npm install
   - rm -r dist
   - npm run build:prod
-  - ls
-  - ls dist
-  - cd dist
-  - echo abc > abc.txt
-  - cd ..
-  - ls dist
   - zip -r dist.zip dist
 before_deploy:
-  - git tag "$(date +'%d/%m/%Y %H:%M:%S:') - travis - $(git log --format=%h -1)"
+  - git tag "$(date +'%d/%m/%Y %H:%M:%S:')-$(git log --format=%h -1)"
 deploy:
   provider: releases
   api_key:
