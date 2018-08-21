@@ -1,21 +1,24 @@
 language: node_js
 node_js: 9
+if: tag IS blank
 script:
   - npm install -g npm
   - npm install
+  - rm -r dist
   - npm run build:prod
   - ls
   - ls dist
   - cd dist
-  - echo abc > abc
+  - echo abc > abc.txt
   - cd ..
-  - zip dist.zip dist
+  - ls dist
+  - zip -r dist.zip dist
 before_deploy:
   - git tag "$(date +'%Y%m%d%H%M%S')-$(git log --format=%h -1)"
 deploy:
   provider: releases
   api_key:
-    secure: _Ev7yi4/RNfqqKPjRXxDTqpNve75GHrpkwbAqX+D5wB2q7g6ShBCx5cza1AE/dw/arQxGFw4Hw6KzTHUSVXEFC0fMropeV5FGDcaP8rpL4lclxDIjDcMkC+6kvak9G1LGmbtzQ5O0r81ZObs1HjE54G/svtwfjOoWneFmX9MEGLM6JqcWgNueMpHqN0oaeLG5mbnELxvpu3llBU6IqI+Iu+4b1zV0YUxN8AsqHDVl4rOae7PZgSqzbrXOszxt4qVqjERJQj9WvFLBWCQ32d/2tIOknhv/LhtwEJVdfcxFEPvX67zOgWcJUDPMqpYsAhQiiuSy4Y309KLTZiCNDkot8BELIht9CQsbAPrvNhlk0WuHbDPSGJaeNfeNAS3kgZ8v+Ci5Q+KT0Gg9LRUoT/f4cPcssV2VFz8UiXJDOGK6lV6WUogUHzc2v2ImyFIEFF0t/ggI7AjiXYGbAuMv1hcUUqX1lCyJKDhODDGyiooRyzOTGGESHsLj+cQjHyKDbPrSazaNFaXvzTNRYY+5Tmtftqt8sd5CtL/Nwf0TBNLaGYzvVijE3k64dQVeZ/wdUwilQC/vSE/cCxCEQDEnq4qYPbZgBzOi5LSVSqcZAbbutc1rUac5yb0b81HO5J+6OVji3c9wJtCeuW9pofwLD1Gp8wcackglC5xAFwVEHKs6REY=
+    secure: gobblydigook
   file: dist.zip
   skip_cleanup: true
   on:
