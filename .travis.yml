@@ -1,5 +1,8 @@
 language: node_js
-node_js: node
+node_js: 
+  - "9.11.1"
+  - "9.11"
+  - "9"
 script:
   - npm install -g npm
   - npm install
